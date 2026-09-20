@@ -13,13 +13,12 @@ Plus: prints a manual testing roadmap based on what it finds.
 pip3 install requests beautifulsoup4
 ```
 # Run
+
 ```
-python3 recon_hunter.py -u https://target.com
+    python3 recon_hunter_v2.py -u https://target.com
+    python3 recon_hunter_v2.py -u https://target.com --full
+    python3 recon_hunter_v2.py -u https://target.com --bola --graphql
+    python3 recon_hunter_v2.py -u https://target.com --nuclei
 ```
-```
-    python3 recon_hunter.py -u https://target.com --js-only
-```
-```
-    python3 recon_hunter.py -u https://target.com --db-only
-```
+
 
