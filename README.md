@@ -8,15 +8,18 @@ Does three things reliably:
 3. Probes for exposed database services
 
 Plus: prints a manual testing roadmap based on what it finds.
-
-Usage:
+# Install dependencies (only two packages needed now)
+``
+pip3 install requests beautifulsoup4
 ```
-    python recon_hunter.py -u https://target.com
+# Run
+```
+python3 recon_hunter.py -u https://target.com
 ```
 ```
-    python recon_hunter.py -u https://target.com --js-only
+    python3 recon_hunter.py -u https://target.com --js-only
 ```
 ```
-    python recon_hunter.py -u https://target.com --db-only
+    python3 recon_hunter.py -u https://target.com --db-only
 ```
 
