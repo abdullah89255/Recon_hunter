@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-recon_hunter.py — Purpose-built bug bounty recon tool.
+🔍 recon_hunter.py — Bug Bounty Recon Tool (Python 3)
 
 Does three things reliably:
-1. Fingerprints web technologies (versions, CMS, frameworks, servers)
-2. Extracts secrets + endpoints from JavaScript files
-3. Probes for exposed database services
+  1. 🛠️  Fingerprints web technologies (server, CMS, frameworks, WAF, analytics)
+  2. 📜  Extracts secrets + endpoints from JavaScript files
+  3. 🗄️  Probes for exposed database services
 
-Plus: prints a manual testing roadmap based on what it finds.
+Plus: prints a tailored manual testing roadmap.
 
 Usage:
-    python recon_hunter.py -u https://target.com
-    python recon_hunter.py -u https://target.com --js-only
-    python recon_hunter.py -u https://target.com --db-only
+    python3 recon_hunter.py -u https://target.com
+    python3 recon_hunter.py -u https://target.com --js-only
+    python3 recon_hunter.py -u https://target.com --db-only
 """
 
 import argparse
 import json
 import re
 import socket
+import ssl
 import sys
 import time
 import urllib.parse
@@ -27,74 +28,213 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
+# ---- Version check ----
+if sys.version_info < (3, 7):
+    print("❌ Python 3.7+ is required.")
+    sys.exit(1)
 
 try:
-    from Wappalyzer import Wappalyzer, WebPage
-    HAS_WAPPALYZER = True
+    import requests
 except ImportError:
-    HAS_WAPPALYZER = False
+    print("❌ Missing dependency: requests")
+    print("   Install with: pip3 install requests beautifulsoup4")
+    sys.exit(1)
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("❌ Missing dependency: beautifulsoup4")
+    print("   Install with: pip3 install beautifulsoup4")
+    sys.exit(1)
+
+# ---- Suppress SSL warnings (many bug bounty targets have cert issues) ----
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ============================================================
-# CONFIG
+# 🎨 TERMINAL COLORS + EMOJIS
 # ============================================================
 
-COMMON_DB_PORTS = {
-    3306: "MySQL / MariaDB",
-    5432: "PostgreSQL",
-    27017: "MongoDB",
-    6379: "Redis",
-    9200: "Elasticsearch",
-    5984: "CouchDB",
-    11211: "Memcached",
-    1433: "MSSQL",
-    1521: "Oracle DB",
-    9042: "Cassandra",
-}
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
 
-# Ports that, if open to the internet, are almost always a finding
-HIGH_RISK_DB_PORTS = {27017, 6379, 9200, 5984, 11211}
+
+def log_info(msg):    print(f"{C.CYAN}ℹ️  {msg}{C.RESET}")
+def log_ok(msg):      print(f"{C.GREEN}✅ {msg}{C.RESET}")
+def log_warn(msg):    print(f"{C.YELLOW}⚠️  {msg}{C.RESET}")
+def log_err(msg):     print(f"{C.RED}❌ {msg}{C.RESET}")
+def log_critical(msg):print(f"{C.MAGENTA}{C.BOLD}🚨 {msg}{C.RESET}")
+def log_arrow(msg):   print(f"{C.BLUE}➡️  {msg}{C.RESET}")
+
+
+# ============================================================
+# ⚙️ CONFIG
+# ============================================================
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# JS secret patterns (curated, high-signal)
+COMMON_DB_PORTS = {
+    3306:  "MySQL / MariaDB",
+    5432:  "PostgreSQL",
+    27017: "MongoDB",
+    6379:  "Redis",
+    9200:  "Elasticsearch",
+    5984:  "CouchDB",
+    11211: "Memcached",
+    1433:  "MSSQL",
+    1521:  "Oracle DB",
+    9042:  "Cassandra",
+}
+
+HIGH_RISK_DB_PORTS = {27017, 6379, 9200, 5984, 11211}
+
+
+# ============================================================
+# 🛠️ TECHNOLOGY SIGNATURES (self-contained, no external DB)
+# ============================================================
+# Format: "Technology Name": {
+#   "headers": {header: regex},
+#   "cookies": [cookie_name_regex],
+#   "html": [regex],
+#   "script": [regex],
+#   "meta": {meta_name: regex},
+#   "category": "CMS|Framework|Server|CDN|Analytics|WAF|Language|Library"
+# }
+
+TECH_SIGNATURES = {
+    # ---- Web Servers ----
+    "Nginx":       {"headers": {"Server": r"nginx(?:/([\d.]+))?"}, "category": "Server"},
+    "Apache":      {"headers": {"Server": r"Apache(?:/([\d.]+))?"}, "category": "Server"},
+    "IIS":         {"headers": {"Server": r"Microsoft-IIS(?:/([\d.]+))?"}, "category": "Server"},
+    "LiteSpeed":   {"headers": {"Server": r"LiteSpeed"}, "category": "Server"},
+    "Caddy":       {"headers": {"Server": r"Caddy"}, "category": "Server"},
+
+    # ---- Languages ----
+    "PHP":         {"headers": {"X-Powered-By": r"PHP(?:/([\d.]+))?"}, "category": "Language"},
+    "ASP.NET":     {"headers": {"X-Powered-By": r"ASP\.NET", "X-AspNet-Version": r"([\d.]+)"}, "category": "Framework"},
+    "Express":     {"headers": {"X-Powered-By": r"Express"}, "category": "Framework"},
+    "Node.js":     {"headers": {"X-Powered-By": r"Node"}, "category": "Language"},
+
+    # ---- CMS ----
+    "WordPress":   {
+        "html": [r"/wp-content/", r"/wp-includes/", r"wp-json"],
+        "meta": {"generator": r"WordPress ?([\d.]+)?"},
+        "category": "CMS"
+    },
+    "Drupal":      {
+        "html": [r"Drupal\.settings", r"/sites/default/files/", r"sites/all/"],
+        "meta": {"generator": r"Drupal ?([\d.]+)?"},
+        "category": "CMS"
+    },
+    "Joomla":      {
+        "html": [r"/components/com_", r"/modules/mod_", r"Joomla!"],
+        "meta": {"generator": r"Joomla!? ?([\d.]+)?"},
+        "category": "CMS"
+    },
+    "Magento":     {
+        "html": [r"Mage\.Cookies", r"/skin/frontend/", r"/mage/"],
+        "category": "E-commerce"
+    },
+    "Shopify":     {
+        "html": [r"cdn\.shopify\.com", r"Shopify\.theme"],
+        "headers": {"X-ShopId": r".+"},
+        "category": "E-commerce"
+    },
+    "Ghost":       {"meta": {"generator": r"Ghost ?([\d.]+)?"}, "category": "CMS"},
+    "TYPO3":       {"meta": {"generator": r"TYPO3 ?([\d.]+)?"}, "category": "CMS"},
+    "PrestaShop":  {"meta": {"generator": r"PrestaShop"}, "category": "E-commerce"},
+
+    # ---- Frontend Frameworks ----
+    "React":       {"html": [r"data-reactroot", r"__REACT_DEVTOOLS", r"_reactRootContainer"], "category": "Framework"},
+    "Next.js":     {"html": [r"__NEXT_DATA__", r"/_next/static/"], "headers": {"X-Powered-By": r"Next\.js"}, "category": "Framework"},
+    "Vue.js":      {"html": [r"data-v-[a-f0-9]{8}", r"__vue__"], "script": [r"vue(?:\.min)?\.js"], "category": "Framework"},
+    "Nuxt.js":     {"html": [r"__NUXT__", r"/_nuxt/"], "category": "Framework"},
+    "Angular":     {"html": [r"ng-version=\"([\d.]+)\"", r"ng-app"], "category": "Framework"},
+    "Svelte":      {"html": [r"__svelte", r"svelte-"], "category": "Framework"},
+    "Ember.js":    {"html": [r"ember-view", r"data-ember-action"], "category": "Framework"},
+    "Backbone.js": {"script": [r"backbone(?:\.min)?\.js"], "category": "Framework"},
+    "jQuery":      {"script": [r"jquery[.-]?([\d.]+)?(?:\.min)?\.js"], "category": "Library"},
+    "Bootstrap":   {"html": [r"bootstrap(?:\.min)?\.(?:css|js)"], "category": "Library"},
+    "Tailwind CSS":{"html": [r"tailwind"], "category": "Library"},
+    "Alpine.js":   {"script": [r"alpine(?:\.min)?\.js"], "category": "Library"},
+
+    # ---- CDN / WAF ----
+    "Cloudflare":  {"headers": {"Server": r"cloudflare", "CF-RAY": r".+"}, "category": "CDN/WAF"},
+    "Akamai":      {"headers": {"Server": r"AkamaiGHost", "X-Akamai-Transformed": r".+"}, "category": "CDN/WAF"},
+    "Fastly":      {"headers": {"X-Served-By": r"cache-", "X-Fastly-Request-ID": r".+"}, "category": "CDN"},
+    "Sucuri":      {"headers": {"X-Sucuri-ID": r".+", "Server": r"Sucuri"}, "category": "WAF"},
+    "AWS CloudFront": {"headers": {"X-Amz-Cf-Id": r".+", "Via": r".*CloudFront"}, "category": "CDN"},
+    "Imperva":     {"headers": {"X-Iinfo": r".+"}, "category": "WAF"},
+    "F5 BIG-IP":   {"cookies": [r"^BIGipServer", r"^TS[0-9a-f]{8}$"], "category": "Load Balancer"},
+    "Varnish":     {"headers": {"X-Varnish": r".+", "Via": r".*varnish"}, "category": "Cache"},
+
+    # ---- Analytics / Tracking ----
+    "Google Analytics": {"script": [r"google-analytics\.com/analytics\.js", r"googletagmanager\.com/gtag"], "category": "Analytics"},
+    "Google Tag Manager": {"script": [r"googletagmanager\.com/gtm\.js"], "category": "Analytics"},
+    "Hotjar":      {"script": [r"static\.hotjar\.com"], "category": "Analytics"},
+    "Segment":     {"script": [r"cdn\.segment\.com"], "category": "Analytics"},
+    "Mixpanel":    {"script": [r"cdn\.mxpanel\.com", r"mixpanel\.com"], "category": "Analytics"},
+    "Facebook Pixel": {"script": [r"connect\.facebook\.net.*fbevents"], "category": "Analytics"},
+
+    # ---- JS Runtimes / Hosting ----
+    "Vercel":      {"headers": {"Server": r"Vercel", "X-Vercel-Id": r".+"}, "category": "Hosting"},
+    "Netlify":     {"headers": {"Server": r"Netlify", "X-Nf-Request-Id": r".+"}, "category": "Hosting"},
+    "GitHub Pages":{"headers": {"Server": r"GitHub\.com"}, "category": "Hosting"},
+    "Heroku":      {"headers": {"Server": r"Heroku", "Via": r".*heroku"}, "category": "Hosting"},
+
+    # ---- Security headers presence ----
+    "HSTS Enabled":   {"headers": {"Strict-Transport-Security": r".+"}, "category": "Security"},
+    "CSP Enabled":    {"headers": {"Content-Security-Policy": r".+"}, "category": "Security"},
+}
+
+
+# ============================================================
+# 🔑 SECRET PATTERNS
+# ============================================================
+
 JS_SECRET_PATTERNS = [
-    ("AWS Access Key", r"AKIA[0-9A-Z]{16}", "CRITICAL"),
-    ("AWS Secret Key", r"(?i)aws.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]", "CRITICAL"),
-    ("Google API Key", r"AIza[0-9A-Za-z\-_]{35}", "HIGH"),
-    ("Google OAuth", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com", "MEDIUM"),
-    ("GitHub Token", r"gh[pousr]_[A-Za-z0-9_]{36,255}", "CRITICAL"),
-    ("GitLab PAT", r"glpat-[A-Za-z0-9\-_]{20}", "CRITICAL"),
-    ("Slack Token", r"xox[baprs]-[0-9a-zA-Z]{10,48}", "CRITICAL"),
-    ("Slack Webhook", r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8,}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}", "CRITICAL"),
-    ("Stripe Live Key", r"sk_live_[0-9a-zA-Z]{24}", "CRITICAL"),
-    ("Stripe Test Key", r"sk_test_[0-9a-zA-Z]{24}", "MEDIUM"),
-    ("SendGrid Key", r"SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}", "CRITICAL"),
-    ("Mailgun Key", r"key-[0-9a-zA-Z]{32}", "HIGH"),
-    ("Twilio SID", r"AC[a-z0-9]{32}", "MEDIUM"),
-    ("Firebase URL", r"https://[a-z0-9-]+\.firebaseio\.com", "MEDIUM"),
-    ("Firebase FCM", r"AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}", "HIGH"),
-    ("DigitalOcean Token", r"dop_v1_[a-f0-9]{64}", "CRITICAL"),
-    ("Shopify Token", r"shpat_[a-fA-F0-9]{32}", "CRITICAL"),
-    ("Discord Webhook", r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", "HIGH"),
-    ("Telegram Bot", r"[0-9]{8,10}:[A-Za-z0-9_-]{35}", "HIGH"),
-    ("Private Key", r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "CRITICAL"),
-    ("JWT", r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "MEDIUM"),
-    ("MongoDB URI", r"mongodb(?:\+srv)?://[^\s'\"]+", "CRITICAL"),
-    ("PostgreSQL URI", r"postgres(?:ql)?://[^\s'\"]+", "CRITICAL"),
-    ("MySQL URI", r"mysql://[^\s'\"]+", "CRITICAL"),
-    ("Redis URI", r"redis://[^\s'\"]+", "CRITICAL"),
-    ("Basic Auth URL", r"https?://[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.@]+@[a-zA-Z0-9_\-\.]+", "CRITICAL"),
-    ("Generic API Key", r"(?i)(api[_\-]?key|apikey)['\"\s:=]+['\"]?([a-zA-Z0-9_\-]{16,64})", "MEDIUM"),
-    ("Generic Secret", r"(?i)(secret|passwd|password|pwd|token)['\"\s:=]+['\"]([a-zA-Z0-9_\-!@#$%^&*]{8,64})['\"]", "MEDIUM"),
+    ("AWS Access Key",      r"AKIA[0-9A-Z]{16}", "CRITICAL"),
+    ("AWS Secret Key",      r"(?i)aws.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]", "CRITICAL"),
+    ("Google API Key",      r"AIza[0-9A-Za-z\-_]{35}", "HIGH"),
+    ("Google OAuth",        r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com", "MEDIUM"),
+    ("GitHub Token",        r"gh[pousr]_[A-Za-z0-9_]{36,255}", "CRITICAL"),
+    ("GitLab PAT",          r"glpat-[A-Za-z0-9\-_]{20}", "CRITICAL"),
+    ("Slack Token",         r"xox[baprs]-[0-9a-zA-Z]{10,48}", "CRITICAL"),
+    ("Slack Webhook",       r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8,}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}", "CRITICAL"),
+    ("Stripe Live Key",     r"sk_live_[0-9a-zA-Z]{24}", "CRITICAL"),
+    ("Stripe Test Key",     r"sk_test_[0-9a-zA-Z]{24}", "MEDIUM"),
+    ("SendGrid Key",        r"SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}", "CRITICAL"),
+    ("Mailgun Key",         r"key-[0-9a-zA-Z]{32}", "HIGH"),
+    ("Twilio SID",          r"AC[a-z0-9]{32}", "MEDIUM"),
+    ("Firebase URL",        r"https://[a-z0-9-]+\.firebaseio\.com", "MEDIUM"),
+    ("Firebase FCM",        r"AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}", "HIGH"),
+    ("DigitalOcean Token",  r"dop_v1_[a-f0-9]{64}", "CRITICAL"),
+    ("Shopify Token",       r"shpat_[a-fA-F0-9]{32}", "CRITICAL"),
+    ("Discord Webhook",     r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", "HIGH"),
+    ("Telegram Bot",        r"[0-9]{8,10}:[A-Za-z0-9_-]{35}", "HIGH"),
+    ("Private Key",         r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "CRITICAL"),
+    ("JWT",                 r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "MEDIUM"),
+    ("MongoDB URI",         r"mongodb(?:\+srv)?://[^\s'\"]+", "CRITICAL"),
+    ("PostgreSQL URI",      r"postgres(?:ql)?://[^\s'\"]+", "CRITICAL"),
+    ("MySQL URI",           r"mysql://[^\s'\"]+", "CRITICAL"),
+    ("Redis URI",           r"redis://[^\s'\"]+", "CRITICAL"),
+    ("Basic Auth URL",      r"https?://[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.@]+@[a-zA-Z0-9_\-\.]+", "CRITICAL"),
+    ("Generic API Key",     r"(?i)(api[_\-]?key|apikey)['\"\s:=]+['\"]?([a-zA-Z0-9_\-]{16,64})", "MEDIUM"),
+    ("Generic Secret",      r"(?i)(secret|passwd|password|pwd|token)['\"\s:=]+['\"]([a-zA-Z0-9_\-!@#$%^&*]{8,64})['\"]", "MEDIUM"),
 ]
 
-# Endpoint extraction patterns
 ENDPOINT_PATTERNS = [
     r"""["'](/(?:api|v\d|graphql|rest|auth|user|admin|internal|debug|config|upload|download|export|webhook)[^"'\s]{0,120})["']""",
     r"""["'](https?://[^"'\s]*(?:api|internal|staging|dev|admin)[^"'\s]*)["']""",
@@ -104,9 +244,25 @@ ENDPOINT_PATTERNS = [
 COMPILED_SECRETS = [(n, re.compile(p), s) for n, p, s in JS_SECRET_PATTERNS]
 COMPILED_ENDPOINTS = [re.compile(p) for p in ENDPOINT_PATTERNS]
 
+# Pre-compile tech signatures
+COMPILED_TECH = {}
+for name, sig in TECH_SIGNATURES.items():
+    compiled = {"category": sig.get("category", "Other")}
+    if "headers" in sig:
+        compiled["headers"] = {h: re.compile(p, re.I) for h, p in sig["headers"].items()}
+    if "cookies" in sig:
+        compiled["cookies"] = [re.compile(p, re.I) for p in sig["cookies"]]
+    if "html" in sig:
+        compiled["html"] = [re.compile(p, re.I) for p in sig["html"]]
+    if "script" in sig:
+        compiled["script"] = [re.compile(p, re.I) for p in sig["script"]]
+    if "meta" in sig:
+        compiled["meta"] = {k: re.compile(v, re.I) for k, v in sig["meta"].items()}
+    COMPILED_TECH[name] = compiled
+
 
 # ============================================================
-# RESULT STORAGE
+# 📦 RESULT STORAGE
 # ============================================================
 
 class Results:
@@ -122,14 +278,14 @@ class Results:
 
     def add_secret(self, source, name, match, severity):
         self.secrets.append({
-            "source": source,
-            "type": name,
-            "match": match[:200],
-            "severity": severity,
+            "source": source, "type": name,
+            "match": match[:200], "severity": severity,
         })
 
     def to_dict(self):
         return {
+            "target_url": getattr(self, "target_url", ""),
+            "scan_time": datetime.utcnow().isoformat(),
             "technologies": self.technologies,
             "secrets": self.secrets,
             "endpoints": sorted(self.endpoints),
@@ -142,96 +298,139 @@ class Results:
 
 
 # ============================================================
-# MODULE 1: TECHNOLOGY FINGERPRINTING
+# 🛠️ MODULE 1: TECHNOLOGY FINGERPRINTING
 # ============================================================
 
-def fingerprint_tech(url: str, results: Results, timeout: int = 15):
-    """Detect web technologies using Wappalyzer fingerprints."""
-    print(f"\n[1/3] Fingerprinting technologies...")
+def fingerprint_tech(url: str, resp: requests.Response, results: Results):
+    """Detect web technologies from response headers, cookies, HTML, and scripts."""
+    print(f"\n{C.BOLD}🛠️  [1/3] Fingerprinting technologies...{C.RESET}")
 
-    if not HAS_WAPPALYZER:
-        print("  [!] wappalyzer-python3 not installed. Install: pip install wappalyzer-python3")
-        return
+    html = resp.text or ""
+    headers = resp.headers
+    cookies = resp.cookies
 
-    try:
-        # Fetch the page first so we can reuse the content
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=timeout,
-            allow_redirects=True,
-            verify=False,
-        )
-        results.headers = dict(resp.headers)
-        results.cookies = [c.name for c in resp.cookies]
+    detected = {}
 
-        # Build WebPage from already-fetched content
-        webpage = WebPage(
-            url,
-            html=resp.text,
-            headers=dict(resp.headers),
-        )
+    for tech, sig in COMPILED_TECH.items():
+        versions = set()
+        matched_via = []
 
-        wappalyzer = Wappalyzer.latest()
-        detected = wappalyzer.analyze_with_versions_and_categories(webpage)
+        # Header check
+        for hname, hpattern in sig.get("headers", {}).items():
+            if hname in headers:
+                m = hpattern.search(headers[hname])
+                if m:
+                    if m.groups() and m.group(1):
+                        versions.add(m.group(1))
+                    matched_via.append(f"header:{hname}")
+                    break
 
-        for tech, info in detected.items():
-            results.technologies[tech] = {
-                "versions": info.get("versions", []),
-                "categories": info.get("categories", []),
+        # Cookie check
+        for cpattern in sig.get("cookies", []):
+            for c in cookies:
+                if cpattern.search(c.name):
+                    matched_via.append(f"cookie:{c.name}")
+                    break
+
+        # HTML body check
+        for hpattern in sig.get("html", []):
+            m = hpattern.search(html)
+            if m:
+                if m.groups() and m.group(1):
+                    versions.add(m.group(1))
+                matched_via.append("html")
+                break
+
+        # Script src check
+        for spattern in sig.get("script", []):
+            m = spattern.search(html)
+            if m:
+                if m.groups() and m.group(1):
+                    versions.add(m.group(1))
+                matched_via.append("script")
+                break
+
+        # Meta tag check
+        if "meta" in sig:
+            soup = BeautifulSoup(html, "html.parser")
+            for meta_name, mpattern in sig["meta"].items():
+                tag = soup.find("meta", attrs={"name": meta_name})
+                if tag and tag.get("content"):
+                    m = mpattern.search(tag["content"])
+                    if m:
+                        if m.groups() and m.group(1):
+                            versions.add(m.group(1))
+                        matched_via.append(f"meta:{meta_name}")
+                        break
+
+        if matched_via:
+            detected[tech] = {
+                "category": sig["category"],
+                "versions": sorted(v for v in versions if v),
+                "matched_via": matched_via,
             }
 
-        print(f"  [+] Detected {len(results.technologies)} technologies:")
-        for tech, info in sorted(results.technologies.items()):
-            ver = f" v{', '.join(info['versions'])}" if info["versions"] else ""
-            cats = ", ".join(info["categories"][:2])
-            print(f"      - {tech}{ver}  [{cats}]")
+    results.technologies = detected
 
-    except Exception as e:
-        results.errors.append(f"fingerprint: {e}")
-        print(f"  [!] Fingerprinting error: {e}")
+    if not detected:
+        log_warn("No technologies identified.")
+        return
+
+    # Group by category for pretty output
+    by_cat = {}
+    for tech, info in detected.items():
+        by_cat.setdefault(info["category"], []).append((tech, info["versions"]))
+
+    for cat in sorted(by_cat):
+        print(f"  {C.YELLOW}📁 {cat}{C.RESET}")
+        for tech, versions in sorted(by_cat[cat]):
+            ver = f" {C.GRAY}v{', v'.join(versions)}{C.RESET}" if versions else ""
+            print(f"     • {C.BOLD}{tech}{C.RESET}{ver}")
+
+    log_ok(f"Detected {len(detected)} technologies across {len(by_cat)} categories")
 
 
 # ============================================================
-# MODULE 2: JAVASCRIPT ANALYSIS
+# 📜 MODULE 2: JAVASCRIPT ANALYSIS
 # ============================================================
 
-def find_js_urls(base_url: str, html: str, timeout: int = 15):
-    """Extract JS file URLs from HTML + try common paths."""
+def find_js_urls(base_url: str, html: str, timeout: int = 10):
+    """Extract JS file URLs from HTML + probe common paths."""
     js_urls = set()
     parsed = urllib.parse.urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    # From <script src="...">
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all("script", src=True):
         src = tag["src"]
         full = urllib.parse.urljoin(base_url, src)
-        if full.endswith(".js") or ".js?" in full:
-            js_urls.add(full)
+        if ".js" in full.lower():
+            js_urls.add(full.split("#")[0])
 
-    # From inline script content — look for .js references
+    # Inline script references
     for script in soup.find_all("script", src=False):
         if script.string:
             for m in re.finditer(r"""["']([^"']+\.js(?:\?[^"']*)?)["']""", script.string):
                 full = urllib.parse.urljoin(base_url, m.group(1))
-                js_urls.add(full)
+                js_urls.add(full.split("#")[0])
 
-    # Common paths
-    common_js = [
+    # Common paths probe (HEAD requests)
+    common_paths = [
         "/static/js/main.js", "/static/js/app.js", "/js/app.js",
         "/assets/js/main.js", "/dist/bundle.js", "/build.js",
         "/main.js", "/app.js", "/bundle.js",
         "/static/js/main.chunk.js", "/static/js/runtime-main.js",
+        "/assets/index.js", "/js/index.js",
     ]
-    for path in common_js:
+    for path in common_paths:
         try:
-            r = requests.head(f"{base}{path}", timeout=5, verify=False,
-                              headers={"User-Agent": USER_AGENT})
-            if r.status_code == 200:
+            r = requests.head(f"{base}{path}", timeout=4, verify=False,
+                              headers={"User-Agent": USER_AGENT},
+                              allow_redirects=True)
+            if r.status_code == 200 and "text/html" not in r.headers.get("Content-Type", ""):
                 js_urls.add(f"{base}{path}")
         except Exception:
-            pass
+            continue
 
     return js_urls
 
@@ -242,11 +441,10 @@ def scan_js_content(content: str, source: str, results: Results):
     for name, pattern, severity in COMPILED_SECRETS:
         for match in pattern.finditer(content):
             matched = match.group(0)
-            # Skip obvious placeholders
             lower = matched.lower()
             if any(p in lower for p in ["your_", "example", "placeholder",
                                          "xxxx", "aaaa", "changeme",
-                                         "insert_", "replace_"]):
+                                         "insert_", "replace_", "dummy"]):
                 continue
             if len(set(matched)) < 5:
                 continue
@@ -261,15 +459,15 @@ def scan_js_content(content: str, source: str, results: Results):
 
 
 def analyze_javascript(base_url: str, html: str, results: Results,
-                       timeout: int = 15, max_files: int = 50):
+                       timeout: int = 10, max_files: int = 50):
     """Download and analyze all JS files found on the page."""
-    print(f"\n[2/3] Analyzing JavaScript files...")
+    print(f"\n{C.BOLD}📜 [2/3] Analyzing JavaScript files...{C.RESET}")
 
     js_urls = find_js_urls(base_url, html, timeout)
-    print(f"  [*] Found {len(js_urls)} JS files to analyze")
+    print(f"  {C.CYAN}🔎 Discovered {len(js_urls)} JS file(s) to fetch{C.RESET}")
 
     if not js_urls:
-        print("  [!] No JS files found. The page may require authentication.")
+        log_warn("No JS files found. Page may require authentication.")
         return
 
     def fetch_and_scan(js_url):
@@ -288,29 +486,49 @@ def analyze_javascript(base_url: str, html: str, results: Results,
 
     scanned = 0
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_and_scan, u): u for u in list(js_urls)[:max_files]}
+        futures = {executor.submit(fetch_and_scan, u): u
+                   for u in list(js_urls)[:max_files]}
         for future in as_completed(futures):
-            js_url, content = future.result()
+            try:
+                js_url, content = future.result()
+            except Exception:
+                continue
             if content:
                 results.js_files.append(js_url)
                 scan_js_content(content, js_url, results)
                 scanned += 1
 
-    print(f"  [+] Scanned {scanned} JS files")
+    log_ok(f"Scanned {scanned}/{len(js_urls)} JS files successfully")
+
+    # Report secrets
     if results.secrets:
-        print(f"  [!!] Found {len(results.secrets)} potential secrets:")
-        for s in results.secrets[:10]:
-            print(f"      [{s['severity']}] {s['type']}: {s['match'][:80]}")
+        log_critical(f"Found {len(results.secrets)} potential secret(s)!")
+        by_sev = {}
+        for s in results.secrets:
+            by_sev.setdefault(s["severity"], []).append(s)
+        for sev in ("CRITICAL", "HIGH", "MEDIUM"):
+            if sev in by_sev:
+                emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡"}[sev]
+                color = {"CRITICAL": C.MAGENTA, "HIGH": C.RED, "MEDIUM": C.YELLOW}[sev]
+                print(f"    {emoji} {color}{sev}{C.RESET}:")
+                for s in by_sev[sev][:5]:
+                    print(f"       • {s['type']}: {C.GRAY}{s['match'][:80]}{C.RESET}")
+    else:
+        log_ok("No secrets detected in JS files")
+
     if results.endpoints:
-        print(f"  [+] Discovered {len(results.endpoints)} unique endpoints")
+        log_info(f"Discovered {len(results.endpoints)} unique endpoint(s)")
+        for ep in sorted(results.endpoints)[:10]:
+            print(f"    🔗 {ep}")
+        if len(results.endpoints) > 10:
+            print(f"    {C.GRAY}... and {len(results.endpoints) - 10} more{C.RESET}")
 
 
 # ============================================================
-# MODULE 3: DATABASE EXPOSURE CHECK
+# 🗄️ MODULE 3: DATABASE EXPOSURE CHECK
 # ============================================================
 
 def check_port(host: str, port: int, timeout: float = 3.0) -> bool:
-    """TCP connect check."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -321,9 +539,7 @@ def check_port(host: str, port: int, timeout: float = 3.0) -> bool:
 def probe_database(host: str, port: int, service: str) -> Optional[dict]:
     """Probe a database service for unauthenticated access."""
     finding = {
-        "host": host,
-        "port": port,
-        "service": service,
+        "host": host, "port": port, "service": service,
         "severity": "HIGH" if port in HIGH_RISK_DB_PORTS else "MEDIUM",
         "evidence": "",
     }
@@ -334,15 +550,20 @@ def probe_database(host: str, port: int, service: str) -> Optional[dict]:
             sock.sendall(b"PING\r\n")
             resp = sock.recv(1024)
             sock.close()
-            if b"PONG" in resp or b"+PONG" in resp:
+            if b"PONG" in resp:
                 finding["evidence"] = "Redis responds to PING without auth"
                 finding["severity"] = "CRITICAL"
                 return finding
 
-        elif port == 27017:  # MongoDB
+        elif port == 27017:  # MongoDB — isMaster handshake
             sock = socket.create_connection((host, port), timeout=5)
-            sock.sendall(bytes.fromhex("3a0000000100000000000000d40700000000000061646d696e2e24636d640000000000ffffffff130000001069736d6173746572000100000000"))
-            resp = sock.recv(1024)
+            payload = bytes.fromhex(
+                "3a0000000100000000000000d407000000000000"
+                "61646d696e2e24636d640000000000ffffffff"
+                "130000001069736d6173746572000100000000"
+            )
+            sock.sendall(payload)
+            resp = sock.recv(2048)
             sock.close()
             if resp and len(resp) > 16:
                 finding["evidence"] = "MongoDB responds to isMaster without auth"
@@ -352,7 +573,7 @@ def probe_database(host: str, port: int, service: str) -> Optional[dict]:
         elif port == 9200:  # Elasticsearch
             r = requests.get(f"http://{host}:{port}/", timeout=5, verify=False)
             if r.status_code == 200 and "tagline" in r.text.lower():
-                finding["evidence"] = f"Elasticsearch info exposed: {r.text[:150]}"
+                finding["evidence"] = f"Elasticsearch info exposed: {r.text[:120]}"
                 finding["severity"] = "CRITICAL"
                 return finding
 
@@ -367,12 +588,28 @@ def probe_database(host: str, port: int, service: str) -> Optional[dict]:
 
         elif port == 5432:  # PostgreSQL
             sock = socket.create_connection((host, port), timeout=5)
-            # Send SSLRequest
-            sock.sendall(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")
+            sock.sendall(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")  # SSLRequest
             resp = sock.recv(1024)
             sock.close()
             if resp:
                 finding["evidence"] = "PostgreSQL accepts connections"
+                return finding
+
+        elif port == 11211:  # Memcached
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.sendall(b"stats\r\n")
+            resp = sock.recv(2048)
+            sock.close()
+            if b"STAT" in resp:
+                finding["evidence"] = "Memcached responds to stats without auth"
+                finding["severity"] = "CRITICAL"
+                return finding
+
+        elif port == 5984:  # CouchDB
+            r = requests.get(f"http://{host}:{port}/", timeout=5, verify=False)
+            if r.status_code == 200 and "couchdb" in r.text.lower():
+                finding["evidence"] = f"CouchDB welcome: {r.text[:120]}"
+                finding["severity"] = "CRITICAL"
                 return finding
 
     except Exception:
@@ -383,7 +620,7 @@ def probe_database(host: str, port: int, service: str) -> Optional[dict]:
 
 def check_databases(host: str, results: Results):
     """Probe common database ports on the target host."""
-    print(f"\n[3/3] Checking for exposed database services...")
+    print(f"\n{C.BOLD}🗄️  [3/3] Checking for exposed database services...{C.RESET}")
 
     open_ports = []
     with ThreadPoolExecutor(max_workers=20) as executor:
@@ -391,235 +628,268 @@ def check_databases(host: str, results: Results):
                    for p, svc in COMMON_DB_PORTS.items()}
         for future in as_completed(futures):
             port, service = futures[future]
-            if future.result():
-                open_ports.append((port, service))
+            try:
+                if future.result():
+                    open_ports.append((port, service))
+            except Exception:
+                continue
 
     if not open_ports:
-        print("  [+] No common database ports open (good)")
+        log_ok("No common database ports open to the internet (good)")
         return
 
-    print(f"  [!] Found {len(open_ports)} open DB ports:")
+    log_warn(f"Found {len(open_ports)} open database port(s):")
     for port, service in open_ports:
-        print(f"      - {port}/tcp ({service})")
+        print(f"  🔓 {port}/tcp — {service}")
         finding = probe_database(host, port, service)
         if finding:
             results.db_findings.append(finding)
-            color = "CRITICAL" if finding["severity"] == "CRITICAL" else "MEDIUM"
-            print(f"        [{color}] {finding['evidence']}")
+            if finding["severity"] == "CRITICAL":
+                log_critical(f"{finding['evidence']}")
+            else:
+                log_warn(f"{finding['evidence']}")
 
 
 # ============================================================
-# MANUAL TESTING ROADMAP
+# 📋 MANUAL TESTING ROADMAP
 # ============================================================
 
 def print_manual_roadmap(results: Results, url: str):
-    """Print tailored next steps based on findings."""
-    print(f"\n{'=' * 70}")
-    print("  MANUAL TESTING ROADMAP — What to do next")
-    print(f"{'=' * 70}")
+    print(f"\n{C.BOLD}{'═' * 68}{C.RESET}")
+    print(f"{C.BOLD}📋 MANUAL TESTING ROADMAP — What to do next{C.RESET}")
+    print(f"{C.BOLD}{'═' * 68}{C.RESET}")
 
     print(f"""
-Your recon is done. Scanners generate candidates, not findings. Every
-report you submit must be manually verified. Here is where to focus
-based on what was found.
+{C.GRAY}Your recon is done. Scanners generate candidates, not findings.
+Every report you submit must be manually verified. Here's where to focus.{C.RESET}
 """)
 
-    # --- Based on technologies ---
-    print("┌─ 1. BASED ON DETECTED TECHNOLOGIES ─────────────────────────┐")
+    # --- Technologies ---
+    print(f"{C.CYAN}┌─ 1️⃣  BASED ON DETECTED TECHNOLOGIES {'─' * 30}┐{C.RESET}")
     tech_lower = {k.lower(): k for k in results.technologies}
     checks = []
 
     if any("wordpress" in t for t in tech_lower):
-        checks.append(
-            "WordPress detected → Enumerate users with `wpscan --url <url> --enumerate u`.\n"
-            "     Check /wp-json/wp/v2/users for user enumeration. Test xmlrpc.php for brute force amplification."
-        )
+        checks.append("WordPress → `wpscan --url <url> --enumerate u,vp` for users & vulnerable plugins. "
+                      "Check /wp-json/wp/v2/users and xmlrpc.php.")
     if any("drupal" in t for t in tech_lower):
-        checks.append(
-            "Drupal detected → Check /CHANGELOG.txt for version. Cross-reference with Drupalgeddon CVEs."
-        )
+        checks.append("Drupal → Check /CHANGELOG.txt for version. Cross-reference with Drupalgeddon CVEs.")
     if any("joomla" in t for t in tech_lower):
-        checks.append(
-            "Joomla detected → Check /administrator/ for admin panel. Look for configuration.php exposure."
-        )
-    if any(t in tech_lower for t in ["react", "vue", "angular", "next.js"]):
-        checks.append(
-            "SPA framework detected → The real attack surface is in the API, not the HTML.\n"
-            "     Open DevTools Network tab, interact with the app, capture all API calls.\n"
-            "     Test each API endpoint for IDOR, missing auth, and mass assignment."
-        )
+        checks.append("Joomla → Check /administrator/ and configuration.php exposure.")
+    if any("magento" in t for t in tech_lower):
+        checks.append("Magento → Check /admin, /downloader. Test for SQLi in product filters.")
+    if any(t in tech_lower for t in ["react", "vue", "angular", "next.js", "nuxt.js", "svelte"]):
+        checks.append("SPA framework → Real attack surface is the API. Open DevTools, click everything, "
+                      "capture ALL API calls, then test each for IDOR/missing auth/mass assignment.")
+    if any("shopify" in t for t in tech_lower):
+        checks.append("Shopify → Test for price manipulation, discount code reuse, checkout logic bugs.")
     if any("nginx" in t for t in tech_lower):
-        checks.append("Nginx detected → Test for path traversal with encoded slashes (%2e%2e%2f), alias misconfig.")
+        checks.append("Nginx → Test for path traversal with %2e%2e%2f, alias misconfig, off-by-slash.")
     if any("apache" in t for t in tech_lower):
-        checks.append("Apache detected → Check /server-status, /server-info. Test for .htaccess bypass.")
-    if any("cloudflare" in t for t in tech_lower):
-        checks.append(
-            "Cloudflare detected → Find origin IP via Shodan/Censys. Test origin directly to bypass WAF."
-        )
+        checks.append("Apache → Check /server-status, /server-info. Test .htaccess bypass.")
+    if any(t in tech_lower for t in ["cloudflare", "akamai", "imperva", "sucuri"]):
+        checks.append("WAF/CDN detected → Find origin IP via Shodan/Censys/crt.sh. Test origin directly to bypass WAF.")
+    if any("graphql" in t for t in tech_lower):
+        checks.append("GraphQL → Run introspection query. Test every mutation for auth.")
 
     if checks:
         for c in checks:
-            print(f"  • {c}")
+            print(f"  {C.YELLOW}➜{C.RESET} {c}")
     else:
-        print("  • No high-value CMS detected. Focus on the application logic instead.")
+        print(f"  {C.GRAY}• No high-value CMS/framework detected. Focus on application logic instead.{C.RESET}")
 
-    # --- Based on secrets ---
-    print("\n┌─ 2. BASED ON JS SECRETS FOUND ──────────────────────────────┐")
+    # --- Secrets ---
+    print(f"\n{C.CYAN}┌─ 2️⃣  BASED ON JS SECRETS {'─' * 41}┐{C.RESET}")
     if results.secrets:
-        print(f"  Found {len(results.secrets)} secrets. For each one:")
-        print("     • Verify it works: try the key against the actual service API")
-        print("     • Determine scope: what can this key access?")
-        print("     • Check if it's a test/staging key or production")
-        print("     • If valid → report immediately with proof (curl output)")
-        print("     • If invalid → note it, might still indicate a pattern")
+        print(f"  {C.RED}Found {len(results.secrets)} secret(s). For EACH one:{C.RESET}")
+        print("     🔹 Verify it works — try the key against the actual service API")
+        print("     🔹 Determine scope — what can this key access?")
+        print("     🔹 Check if it's test/staging vs production")
+        print("     🔹 If valid → report immediately with proof (curl output as screenshot)")
+        print("     🔹 If invalid → note it, might still indicate a pattern for escalation")
     else:
-        print("  • No secrets found in JS. Try:")
-        print("     • Check all JS files manually at /static/js/, /assets/, /dist/")
-        print("     • Look at source maps (.js.map) — they often contain original source")
-        print("     • Check the mobile app's APK/IPA if in scope")
+        print(f"  {C.GRAY}• No secrets found in JS. Try:{C.RESET}")
+        print("     🔹 Check all JS files manually: /static/js/, /assets/, /dist/")
+        print("     🔹 Look for source maps (.js.map) — often contain original unminified source")
+        print("     🔹 Check the mobile app's APK/IPA if in scope (decompile with jadx/apktool)")
 
-    # --- Based on endpoints ---
-    print("\n┌─ 3. BASED ON DISCOVERED ENDPOINTS ──────────────────────────┐")
+    # --- Endpoints ---
+    print(f"\n{C.CYAN}┌─ 3️⃣  BASED ON DISCOVERED ENDPOINTS {'─' * 31}┐{C.RESET}")
     if results.endpoints:
-        print(f"  Found {len(results.endpoints)} endpoints. For each one:")
-        print("     • Visit it without auth → does it leak data?")
-        print("     • Visit it with a low-priv account → can you access admin data?")
-        print("     • Change IDs in the path/params → IDOR?")
-        print("     • Change HTTP method (GET → POST/PUT/DELETE) → method bypass?")
-        print("     • Add ?debug=1, ?admin=true, ?test=1 → debug mode activation?")
+        print(f"  {C.YELLOW}Found {len(results.endpoints)} endpoint(s). For EACH one:{C.RESET}")
+        print("     🔹 Visit without auth → does it leak data?")
+        print("     🔹 Visit with low-priv account → can you access higher-priv data?")
+        print("     🔹 Change IDs in path/params → IDOR?")
+        print("     🔹 Change HTTP method (GET → POST/PUT/DELETE) → method bypass?")
+        print("     🔹 Add ?debug=1, ?admin=true, ?test=1 → debug mode activation?")
     else:
-        print("  • No endpoints extracted. Manually map the app:")
-        print("     • Use Burp Suite, click every button, capture every request")
-        print("     • Check /robots.txt, /sitemap.xml, /api/docs, /swagger.json")
+        print(f"  {C.GRAY}• No endpoints extracted. Manually map:{C.RESET}")
+        print("     🔹 Use Burp Suite, click every button, capture every request")
+        print("     🔹 Check /robots.txt, /sitemap.xml, /api/docs, /swagger.json, /openapi.json")
 
-    # --- Based on DB findings ---
-    print("\n┌─ 4. BASED ON DATABASE FINDINGS ─────────────────────────────┐")
+    # --- Database ---
+    print(f"\n{C.CYAN}┌─ 4️⃣  BASED ON DATABASE FINDINGS {'─' * 34}┐{C.RESET}")
     if results.db_findings:
-        print("  [!] Database services exposed! This is a high-priority finding.")
-        print("     • For MongoDB: try `mongosh --host <ip> --port 27017` with no auth")
-        print("     • For Redis: try `redis-cli -h <ip> -p 6379` → `INFO` → `KEYS *`")
-        print("     • For Elasticsearch: visit http://<ip>:9200/_cat/indices")
-        print("     • Document EVERYTHING before reporting — take screenshots")
-        print("     • Do NOT dump more data than needed to prove access")
+        print(f"  {C.MAGENTA}{C.BOLD}🚨 Database services exposed! High-priority finding.{C.RESET}")
+        print("     🔹 MongoDB: `mongosh --host <ip> --port 27017` with no auth")
+        print("     🔹 Redis: `redis-cli -h <ip> -p 6379` → INFO → KEYS *")
+        print("     🔹 Elasticsearch: visit http://<ip>:9200/_cat/indices")
+        print("     🔹 Document EVERYTHING — screenshot before reporting")
+        print("     🔹 Do NOT dump more data than needed to prove access")
     else:
-        print("  • No DB ports open directly. That's normal — databases are usually internal.")
-        print("     • Instead, look for SQL injection in web parameters")
-        print("     • Check for .env, .git/config, backup.sql file exposure")
-        print("     • Try GraphQL introspection at /graphql, /api/graphql")
+        print(f"  {C.GRAY}• No DB ports open directly (normal — DBs are usually internal){C.RESET}")
+        print("     🔹 Instead, hunt for SQL injection in web parameters")
+        print("     🔹 Check for .env, .git/config, backup.sql file exposure")
+        print("     🔹 Try GraphQL introspection at /graphql, /api/graphql")
 
-    # --- Universal manual checklist ---
-    print("\n┌─ 5. UNIVERSAL MANUAL CHECKLIST ─────────────────────────────┐")
-    print("""
-  Regardless of automated findings, always manually test:
+    # --- Universal checklist ---
+    print(f"\n{C.CYAN}┌─ 5️⃣  UNIVERSAL MANUAL CHECKLIST {'─' * 34}┐{C.RESET}")
+    print(f"""
+  {C.BOLD}🔐 Authentication{C.RESET}
+     [ ] Password reset: does token expire? Is it predictable?
+     [ ] Email change: can you change it without confirmation?
+     [ ] 2FA bypass: can you skip the 2FA step by direct navigation?
+     [ ] Session fixation: does session ID change after login?
 
-  [ ] Authentication
-      - Password reset flow: does the token expire? Is it predictable?
-      - Email change: can you change email without confirmation?
-      - 2FA bypass: can you skip the 2FA step by direct navigation?
-      - Session fixation: does the session ID change after login?
+  {C.BOLD}🚪 Access Control (IDOR / BOLA){C.RESET}
+     [ ] Create two accounts. Use A's session to access B's objects.
+     [ ] Change every numeric/UUID identifier in every request.
+     [ ] Check horizontal (same role) and vertical (user → admin) escalation.
 
-  [ ] Access Control (IDOR / BOLA)
-      - Create two accounts. Use account A's session to access account B's objects.
-      - Change every numeric/UUID identifier in every request.
-      - Check horizontal (same role, different user) and vertical (user → admin) escalation.
+  {C.BOLD}💼 Business Logic{C.RESET}
+     [ ] Negative quantities in carts, price manipulation
+     [ ] Race conditions: send the same request 20x concurrently
+     [ ] Coupon reuse, referral abuse, unlimited free trials
 
-  [ ] Business Logic
-      - Negative quantities in carts, price manipulation
-      - Race conditions: send the same request 20 times concurrently
-      - Coupon reuse, referral abuse, unlimited free trials
+  {C.BOLD}🔍 Information Disclosure{C.RESET}
+     [ ] Error pages with stack traces (trigger 500s with malformed input)
+     [ ] /phpinfo.php, /.env, /.git/config, /backup/, /debug/
+     [ ] Response headers leaking internal IPs, paths, or versions
 
-  [ ] Information Disclosure
-      - Error pages with stack traces (trigger 500s with malformed input)
-      - /phpinfo.php, /.env, /.git/config, /backup/, /debug/
-      - Response headers leaking internal IPs, paths, or versions
+  {C.BOLD}🌐 API-Specific{C.RESET}
+     [ ] Mass assignment: send extra fields in JSON (role, isAdmin, balance)
+     [ ] GraphQL: introspection, then test every mutation for auth
+     [ ] Rate limiting: is it absent on login, OTP, password reset?
 
-  [ ] API-Specific
-      - Mass assignment: send extra fields in JSON bodies (role, isAdmin, balance)
-      - GraphQL: introspection query, then test every mutation for auth
-      - Rate limiting: is it absent on login, OTP, password reset?
-
-  [ ] Client-Side
-      - DOM XSS: check postMessage handlers, innerHTML sinks
-      - CORS: test with Origin: https://evil.com and credentials
-      - Clickjacking: does the app set X-Frame-Options or CSP frame-ancestors?
+  {C.BOLD}💻 Client-Side{C.RESET}
+     [ ] DOM XSS: check postMessage handlers, innerHTML sinks
+     [ ] CORS: test with Origin: https://evil.com + credentials
+     [ ] Clickjacking: does app set X-Frame-Options or CSP frame-ancestors?
 """)
 
-    print(f"{'=' * 70}")
-    print("  Remember: scanners find candidates. YOU verify and report findings.")
-    print(f"{'=' * 70}\n")
+    print(f"{C.BOLD}{'═' * 68}{C.RESET}")
+    print(f"{C.GREEN}💡 Remember: scanners find candidates. YOU verify and report.{C.RESET}")
+    print(f"{C.BOLD}{'═' * 68}{C.RESET}\n")
 
 
 # ============================================================
-# MAIN
+# 🚀 MAIN
 # ============================================================
+
+def print_banner(url: str, host: str):
+    print(f"""
+{C.CYAN}{C.BOLD}╔══════════════════════════════════════════════════════════════╗
+║  🔍  RECON HUNTER — Bug Bounty Recon Tool (Python 3)         ║
+╠══════════════════════════════════════════════════════════════╣
+║  🎯 Target: {url:<49}║
+║  🌐 Host:   {host:<49}║
+║  ⏰ Time:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):<49}║
+╚══════════════════════════════════════════════════════════════╝{C.RESET}
+""")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Recon tool: tech fingerprinting + JS secrets + DB exposure",
+        description="🔍 Recon tool: tech fingerprinting + JS secrets + DB exposure",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 recon_hunter.py -u https://target.com
+  python3 recon_hunter.py -u https://target.com --js-only
+  python3 recon_hunter.py -u https://target.com --db-only
+  python3 recon_hunter.py -u target.com -o my_scan
+        """,
     )
-    parser.add_argument("-u", "--url", required=True, help="Target URL")
-    parser.add_argument("-o", "--output", default="recon_report", help="Output file prefix")
-    parser.add_argument("--js-only", action="store_true", help="Only run JS analysis")
-    parser.add_argument("--db-only", action="store_true", help="Only run DB check")
-    parser.add_argument("--timeout", type=int, default=15)
-    parser.add_argument("--no-verify", action="store_true", default=True,
-                        help="Skip SSL verification (default: on)")
+    parser.add_argument("-u", "--url", required=True, help="🎯 Target URL")
+    parser.add_argument("-o", "--output", default="recon_report",
+                        help="📁 Output file prefix (default: recon_report)")
+    parser.add_argument("--js-only", action="store_true",
+                        help="📜 Only run JS analysis")
+    parser.add_argument("--db-only", action="store_true",
+                        help="🗄️  Only run DB port check")
+    parser.add_argument("--timeout", type=int, default=15,
+                        help="⏱️  Request timeout in seconds (default: 15)")
+    parser.add_argument("--insecure", action="store_true", default=True,
+                        help="🔓 Skip SSL verification (default: on for bug bounty)")
 
     args = parser.parse_args()
 
-    # Suppress SSL warnings
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    url = args.url
+    # Normalize URL
+    url = args.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.split(":")[0]
 
-    print(f"""
-╔══════════════════════════════════════════════════════════╗
-║              RECON HUNTER — Bug Bounty Recon             ║
-╠══════════════════════════════════════════════════════════╣
-║  Target: {url:<48}║
-║  Host:   {host:<48}║
-╚══════════════════════════════════════════════════════════╝
-""")
+    print_banner(url, host)
 
     results = Results()
+    results.target_url = url
 
-    # Fetch the page once for reuse
+    # Fetch the page once
     html = ""
     try:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT},
-                            timeout=args.timeout, verify=False, allow_redirects=True)
+        resp = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=args.timeout,
+            verify=False,
+            allow_redirects=True,
+        )
         html = resp.text
         results.headers = dict(resp.headers)
         results.cookies = [c.name for c in resp.cookies]
-        print(f"[+] Fetched page: {resp.status_code}, {len(html)} bytes")
+        log_ok(f"Fetched page: HTTP {resp.status_code}, {len(html):,} bytes")
+    except requests.exceptions.SSLError:
+        log_err(f"SSL error fetching {url}. Try a different scheme or check the cert.")
+        sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        log_err(f"Cannot connect to {url}. Check the URL and network.")
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        log_err(f"Timeout after {args.timeout}s. Increase with --timeout.")
+        sys.exit(1)
     except Exception as e:
-        print(f"[!] Could not fetch page: {e}")
+        log_err(f"Failed to fetch {url}: {e}")
         sys.exit(1)
 
     # Run selected modules
-    if not args.js_only and not args.db_only:
-        fingerprint_tech(url, results, args.timeout)
-        analyze_javascript(url, html, results, args.timeout)
-        check_databases(host, results)
-    elif args.js_only:
-        analyze_javascript(url, html, results, args.timeout)
-    elif args.db_only:
-        check_databases(host, results)
+    try:
+        if not args.js_only and not args.db_only:
+            fingerprint_tech(url, resp, results)
+            analyze_javascript(url, html, results, args.timeout)
+            check_databases(host, results)
+        elif args.js_only:
+            analyze_javascript(url, html, results, args.timeout)
+        elif args.db_only:
+            check_databases(host, results)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        log_err(f"Scanner error: {e}")
+        results.errors.append(str(e))
 
-    # Save JSON report
+    # Save report
     out_path = Path(f"{args.output}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    with open(out_path, "w") as f:
-        json.dump(results.to_dict(), f, indent=2, default=str)
-    print(f"\n[+] JSON report saved: {out_path}")
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(results.to_dict(), f, indent=2, default=str)
+        log_ok(f"JSON report saved: {out_path}")
+    except Exception as e:
+        log_err(f"Could not save report: {e}")
 
-    # Print manual roadmap
+    # Print roadmap
     print_manual_roadmap(results, url)
 
 
@@ -627,5 +897,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[!] Interrupted.")
+        print(f"\n{C.YELLOW}⚠️  Interrupted by user.{C.RESET}")
         sys.exit(130)
