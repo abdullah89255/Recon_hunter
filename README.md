@@ -1,5 +1,5 @@
 # Recon_hunter
-"""
+
 recon_hunter.py — Purpose-built bug bounty recon tool.
 
 Does three things reliably:
@@ -10,7 +10,13 @@ Does three things reliably:
 Plus: prints a manual testing roadmap based on what it finds.
 
 Usage:
+```
     python recon_hunter.py -u https://target.com
+```
+```
     python recon_hunter.py -u https://target.com --js-only
+```
+```
     python recon_hunter.py -u https://target.com --db-only
-"""
+```
+
